@@ -71,3 +71,5 @@ try:
 except KeyboardInterrupt:
     print("\nStopping...")
     cam.stop()
+
+PYTHONPATH=build/python python3 my_temp_classifier.py
