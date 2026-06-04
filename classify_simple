@@ -1,0 +1,73 @@
+import sys
+import time
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+
+# --- Classification logic ---
+def classify(temp_c):
+    if temp_c < 35.0:
+        return "HYPOTHERMIA"
+    elif temp_c < 37.5:
+        return "NORMAL"
+    elif temp_c < 38.5:
+        return "LOW FEVER"
+    elif temp_c < 40.0:
+        return "HIGH FEVER"
+    else:
+        return "EMERGENCY"
+
+# --- Camera setup ---
+linear_cal = g.CameraLinearCal()
+last_status = [None]
+last_frame = [None]
+
+def on_frame(frame):
+    last_frame[0] = frame
+    # Refit calibration if we have status
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except:
+            pass
+
+cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
+cam.configure_thermography(g.ThermographyConfig(emissivity=95))
+cam.start(on_frame)
+
+print("Sensor started. Warming up...")
+time.sleep(3)  # wait for calibration to settle
+
+# --- Main loop ---
+print("Reading temperature every 2 seconds. Point sensor at face.\n")
+try:
+    while True:
+        # Get fresh status for calibration
+        try:
+            s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+            if s:
+                last_status[0] = s
+                if last_frame[0] is not None:
+                    linear_cal.fit(last_frame[0].y16, s)
+        except:
+            pass
+
+        # Decode temperatures
+        if last_frame[0] is not None and linear_cal.ready():
+            temps = linear_cal.decode(last_frame[0].y16)
+            
+            # Find hottest point (likely face/forehead)
+            max_temp = float(np.max(temps))
+            max_pos = np.unravel_index(np.argmax(temps), temps.shape)
+            
+            status = classify(max_temp)
+            print(f"Hottest point: {max_temp:.1f}°C at pixel {max_pos} → {status}")
+        else:
+            print("Calibrating...")
+
+        time.sleep(2)
+
+except KeyboardInterrupt:
+    print("\nStopping...")
+    cam.stop()
