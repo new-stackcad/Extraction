@@ -1,49 +1,51 @@
+nano ~/guideusb2_linux_sdk/my_simple_temp.py
+
+PYTHONPATH=build/python python3 my_simple_temp.py
+
 import sys
 import time
 sys.path.insert(0, 'build/python')
 
 import guideusb2 as g
 import numpy as np
+import cv2
 
-# --- Classification logic ---
+# --- Classification ---
 def classify(temp_c):
-    if temp_c < 35.0:
-        return "HYPOTHERMIA"
+    if temp_c < 34.0:
+        return "NO FACE", (128, 128, 128)
     elif temp_c < 37.5:
-        return "NORMAL"
+        return "NORMAL", (0, 255, 0)
     elif temp_c < 38.5:
-        return "LOW FEVER"
-    elif temp_c < 40.0:
-        return "HIGH FEVER"
+        return "LOW FEVER", (0, 165, 255)
     else:
-        return "EMERGENCY"
+        return "HIGH FEVER", (0, 0, 255)
 
-# --- Camera setup ---
+# --- State ---
 linear_cal = g.CameraLinearCal()
 last_status = [None]
-last_frame = [None]
+last_frame  = [None]
 
 def on_frame(frame):
     last_frame[0] = frame
-    # Refit calibration if we have status
     if last_status[0] is not None:
         try:
             linear_cal.fit(frame.y16, last_status[0])
         except:
             pass
 
+# --- Start camera ---
 cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
 cam.configure_thermography(g.ThermographyConfig(emissivity=95))
 cam.start(on_frame)
+print("Warming up... please wait")
+time.sleep(3)
 
-print("Sensor started. Warming up...")
-time.sleep(3)  # wait for calibration to settle
+print("Live view started. Press Q to quit.")
 
-# --- Main loop ---
-print("Reading temperature every 2 seconds. Point sensor at face.\n")
 try:
     while True:
-        # Get fresh status for calibration
+        # Refresh calibration
         try:
             s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
             if s:
@@ -53,23 +55,68 @@ try:
         except:
             pass
 
-        # Decode temperatures
-        if last_frame[0] is not None and linear_cal.ready():
-            temps = linear_cal.decode(last_frame[0].y16)
-            
-            # Find hottest point (likely face/forehead)
-            max_temp = float(np.max(temps))
-            max_pos = np.unravel_index(np.argmax(temps), temps.shape)
-            
-            status = classify(max_temp)
-            print(f"Hottest point: {max_temp:.1f}°C at pixel {max_pos} → {status}")
-        else:
+        if last_frame[0] is None or not linear_cal.ready():
             print("Calibrating...")
+            time.sleep(1)
+            continue
 
-        time.sleep(2)
+        # Decode full temperature array
+        temps = linear_cal.decode(last_frame[0].y16)
+        h, w  = temps.shape
+
+        # --- Find face region ---
+        # Smooth the temp array to reduce noise
+        temps_smooth = temps.copy()
+
+        # Only look at pixels above 32°C (likely skin)
+        face_mask = temps_smooth > 32.0
+
+        # Find the hottest 5x5 region average (more stable than single pixel)
+        best_temp = 0
+        best_pos  = (h//2, w//2)
+        step = 5
+        for row in range(0, h - step, step):
+            for col in range(0, w - step, step):
+                region = temps[row:row+step, col:col+step]
+                if np.mean(region) > best_temp:
+                    best_temp = float(np.mean(region))
+                    best_pos  = (row + step//2, col + step//2)
+
+        # --- Classify ---
+        label, color = classify(best_temp)
+
+        # --- Build display image ---
+        # Apply palette (IronRed)
+        palette = g.Palette.IronRed
+        opts    = g.PaletteOptions(auto_range=True)
+        rgb     = g.apply_palette(last_frame[0].y16, palette, opts)
+        display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        display = cv2.resize(display, (w*2, h*2))  # 2x zoom
+
+        # Draw crosshair on hotspot
+        cx = best_pos[1] * 2
+        cy = best_pos[0] * 2
+        cv2.circle(display, (cx, cy), 15, color, 2)
+        cv2.line(display, (cx-20, cy), (cx+20, cy), color, 1)
+        cv2.line(display, (cx, cy-20), (cx, cy+20), color, 1)
+
+        # Draw temperature and status text
+        cv2.putText(display, f"{best_temp:.1f} C", (cx+18, cy-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(display, label, (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+        cv2.putText(display, f"min:{last_status[0].min_c:.1f} max:{last_status[0].max_c:.1f}",
+                    (20, h*2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+
+        # Show window
+        cv2.imshow("Thermal Health Monitor", display)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
 except KeyboardInterrupt:
-    print("\nStopping...")
+    pass
+finally:
     cam.stop()
-
-PYTHONPATH=build/python python3 my_temp_classifier.py
+    cv2.destroyAllWindows()
+    print("Stopped.")
