@@ -2,6 +2,10 @@ nano ~/guideusb2_linux_sdk/my_simple_temp.py
 
 PYTHONPATH=build/python python3 my_simple_temp.py
 
+python3 -c "import pyrealsense2; print('realsense ok')"
+python3 -c "import mediapipe; print('mediapipe ok')"
+python3 -c "import cv2; print(cv2.__version__)"
+
 import sys
 import time
 sys.path.insert(0, 'build/python')
