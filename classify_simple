@@ -61,8 +61,10 @@ cam.configure_thermography(g.ThermographyConfig(emissivity=98))
 cam.start(on_frame)
 print("Warming up... please wait")
 time.sleep(3)
-
 print("Live view started. Press Q to quit.")
+
+# Create window once — keeps it in focus for Q key
+cv2.namedWindow("Thermal Health Monitor", cv2.WINDOW_NORMAL)
 
 try:
     while True:
@@ -100,8 +102,8 @@ try:
         label, color = classify(best_temp)
 
         # --- Build display image ---
-        temps  = linear_cal.decode(last_frame[0].y16)
-        h, w   = temps.shape
+        temps   = linear_cal.decode(last_frame[0].y16)
+        h, w    = temps.shape
         palette = g.Palette.IronRed
         opts    = g.PaletteOptions(auto_range=True)
         rgb     = g.apply_palette(last_frame[0].y16, palette, opts)
@@ -133,13 +135,15 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (200, 200, 200), 1)
 
-        # Show window
+        # Show window — waitKey(30) gives enough time to catch Q
         cv2.imshow("Thermal Health Monitor", display)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('q') or key == ord('Q') or key == 27:  # Q or Escape
+            print("Quitting...")
             break
 
 except KeyboardInterrupt:
-    pass
+    print("\nStopped by user.")
 finally:
     cam.stop()
     cv2.destroyAllWindows()
