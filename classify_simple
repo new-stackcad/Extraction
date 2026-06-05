@@ -6,6 +6,15 @@ pip3 install pyrealsense2
 
 pip3 install mediapipe
 
+python3 -c "
+import pyrealsense2 as rs
+ctx = rs.context()
+devices = ctx.query_devices()
+print(f'Found {len(devices)} RealSense device(s)')
+for d in devices:
+    print(d.get_info(rs.camera_info.name))
+"
+
 PYTHONPATH=build/python python3 my_simple_temp.py
 
 python3 -c "import pyrealsense2; print('realsense ok')"
