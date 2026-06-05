@@ -1,5 +1,11 @@
 nano ~/guideusb2_linux_sdk/my_simple_temp.py
 
+python3 -m pip install --upgrade pip
+
+pip3 install pyrealsense2
+
+pip3 install mediapipe
+
 PYTHONPATH=build/python python3 my_simple_temp.py
 
 python3 -c "import pyrealsense2; print('realsense ok')"
