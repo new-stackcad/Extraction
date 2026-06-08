@@ -1,0 +1,5 @@
+cd ~/guideusb2_linux_sdk
+nano thermal_face_detector.py
+
+lsusb | grep -i infrared
+ls /dev/ttyACM*
