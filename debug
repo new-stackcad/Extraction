@@ -1,3 +1,83 @@
+nano ~/guideusb2_linux_sdk/debug_tfake.py
+
+PYTHONPATH=build/python python3 debug_tfake.py
+
+import sys
+import time
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+from tfan import ThermalLandmarks
+
+linear_cal  = g.CameraLinearCal()
+last_status = [None]
+last_frame  = [None]
+
+def on_frame(frame):
+    last_frame[0] = frame
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except:
+            pass
+
+print("Loading T-FAKE...")
+landmarker = ThermalLandmarks(device="cpu", n_landmarks=478)
+print("Ready.")
+
+cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
+cam.configure_thermography(g.ThermographyConfig(emissivity=98))
+cam.start(on_frame)
+print("Warming up...")
+time.sleep(3)
+
+try:
+    s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+    if s:
+        last_status[0] = s
+        if last_frame[0] is not None:
+            linear_cal.fit(last_frame[0].y16, s)
+except:
+    pass
+
+time.sleep(2)
+
+if last_frame[0] is not None and linear_cal.ready():
+    temps  = linear_cal.decode(last_frame[0].y16)
+    h, w   = temps.shape
+    t_min  = float(temps.min())
+    t_max  = float(temps.max())
+    spread = t_max - t_min
+
+    if spread > 0:
+        gray = ((temps - t_min) / spread * 255).astype(np.uint8)
+    else:
+        gray = np.zeros((h, w), dtype=np.uint8)
+
+    landmarks, confidences = landmarker.process(gray)
+
+    print(f"Type of landmarks: {type(landmarks)}")
+    print(f"Type of confidences: {type(confidences)}")
+
+    if landmarks is not None:
+        lms = np.array(landmarks)
+        print(f"lms shape: {lms.shape}")
+        print(f"lms dtype: {lms.dtype}")
+        print(f"lms[0]: {lms[0]}")
+        print(f"lms[0] type: {type(lms[0])}")
+        print(f"lms[0][0]: {lms[0][0]}")
+        print(f"lms[0][0] type: {type(lms[0][0])}")
+        print(f"First 5 landmarks:\n{lms[:5]}")
+
+        confs = np.array(confidences)
+        print(f"confs shape: {confs.shape}")
+        print(f"confs dtype: {confs.dtype}")
+        print(f"First 5 confs: {confs[:5]}")
+
+cam.stop()
+print("Done.")
+
 nano ~/guideusb2_linux_sdk/debug_live.py
 
 cd ~/guideusb2_linux_sdk
