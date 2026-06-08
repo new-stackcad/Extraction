@@ -1,3 +1,7 @@
+sudo systemctl enable ssh
+sudo systemctl start ssh
+sudo systemctl status ssh
+
 nano ~/guideusb2_linux_sdk/debug_tfake.py
 
 PYTHONPATH=build/python python3 debug_tfake.py
