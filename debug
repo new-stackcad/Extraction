@@ -54,8 +54,8 @@ try:
         h, w  = temps.shape
 
         # Normalise to grayscale
-        t_min = temps.min()
-        t_max = temps.max()
+        t_min  = float(temps.min())
+        t_max  = float(temps.max())
         spread = t_max - t_min
 
         print(f"Temp range: {t_min:.1f} - {t_max:.1f}  spread: {spread:.1f}C")
@@ -66,44 +66,82 @@ try:
             gray = np.zeros((h, w), dtype=np.uint8)
 
         # Try landmark detection
-        landmarks, confidences = landmarker.process(gray)
+        try:
+            landmarks, confidences = landmarker.process(gray)
+        except Exception as e:
+            print(f"Detection error: {e}")
+            landmarks, confidences = None, None
 
-        # Show what the model sees
+        # Build display from grayscale
         display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         display = cv2.resize(display, (w * 2, h * 2))
 
         if landmarks is not None:
-            valid = [(i, lm) for i, lm in enumerate(landmarks)
-                     if lm[0] != -1 and lm[1] != -1]
-            print(f"Valid landmarks: {len(valid)}/478  "
-                  f"Max conf: {confidences.max():.3f}")
+            # Safely filter valid landmarks
+            valid = []
+            for i, lm in enumerate(landmarks):
+                try:
+                    lx = int(lm[0])
+                    ly = int(lm[1])
+                    if lx >= 0 and ly >= 0:
+                        valid.append((i, lx, ly))
+                except:
+                    pass
 
-            for i, lm in valid:
-                px, py = int(lm[0]) * 2, int(lm[1]) * 2
+            max_conf = float(confidences.max()) if confidences is not None else 0.0
+            print(f"Valid landmarks: {len(valid)}/478  "
+                  f"Max conf: {max_conf:.4f}")
+
+            # Draw all valid landmarks
+            for i, lx, ly in valid:
+                px, py = lx * 2, ly * 2
                 if 0 <= px < w*2 and 0 <= py < h*2:
                     cv2.circle(display, (px, py), 2, (0, 255, 0), -1)
 
-            # Show inner canthus specifically
-            lc = landmarks[133]
-            rc = landmarks[362]
-            if lc[0] != -1:
-                cv2.circle(display, (lc[0]*2, lc[1]*2), 6, (0, 255, 255), 2)
-            if rc[0] != -1:
-                cv2.circle(display, (rc[0]*2, rc[1]*2), 6, (0, 255, 255), 2)
+            # Highlight inner canthus
+            try:
+                lc_x, lc_y = int(landmarks[133][0]), int(landmarks[133][1])
+                rc_x, rc_y = int(landmarks[362][0]), int(landmarks[362][1])
+                if lc_x >= 0 and lc_y >= 0:
+                    cv2.circle(display, (lc_x*2, lc_y*2), 8, (0, 255, 255), 2)
+                    cv2.putText(display, "LC",
+                                (lc_x*2 + 6, lc_y*2 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (0, 255, 255), 1)
+                if rc_x >= 0 and rc_y >= 0:
+                    cv2.circle(display, (rc_x*2, rc_y*2), 8, (0, 255, 255), 2)
+                    cv2.putText(display, "RC",
+                                (rc_x*2 + 6, rc_y*2 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (0, 255, 255), 1)
+            except:
+                pass
 
-            cv2.putText(display, f"Valid: {len(valid)}/478",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 255, 0), 2)
+            # Highlight forehead
+            try:
+                ft_x, ft_y = int(landmarks[10][0]), int(landmarks[10][1])
+                if ft_x >= 0 and ft_y >= 0:
+                    cv2.circle(display, (ft_x*2, ft_y*2), 8, (255, 165, 0), 2)
+                    cv2.putText(display, "FH",
+                                (ft_x*2 + 6, ft_y*2 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (255, 165, 0), 1)
+            except:
+                pass
+
+            cv2.putText(display,
+                        f"Valid: {len(valid)}/478  conf: {max_conf:.4f}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
             print("No landmarks returned")
             cv2.putText(display, "NO DETECTION",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 0, 255), 2)
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # Also show grayscale value at centre
-        cy_c, cx_c = h//2, w//2
+        # Show spread and grey value at centre
         cv2.putText(display,
-                    f"spread:{spread:.1f}C  grey:{gray[cy_c,cx_c]}",
+                    f"spread: {spread:.1f}C  min:{t_min:.1f} max:{t_max:.1f}",
                     (10, h*2 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
