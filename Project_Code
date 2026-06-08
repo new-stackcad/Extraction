@@ -3,3 +3,5 @@ nano thermal_face_detector.py
 
 lsusb | grep -i infrared
 ls /dev/ttyACM*
+
+python3 -c "from tfan import ThermalLandmarks; print('T-FAKE ready')"
