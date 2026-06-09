@@ -24,6 +24,9 @@ THRESH_NORMAL     = 37.1
 THRESH_LOW_FEVER  = 37.5
 THRESH_HIGH_FEVER = 39.0
 
+# --- Temporal smoothing ---
+MAX_NO_DETECT = 3
+
 def classify(temp_c):
     if temp_c < THRESH_NO_FACE:
         return "NO FACE", (128, 128, 128)
@@ -46,16 +49,17 @@ def get_region_temp(temps, px, py, radius=3):
     return float(np.max(region)) if region.size > 0 else 0.0
 
 def scale_landmarks(lms, orig_w, orig_h):
-    """Scale T-FAKE landmarks from 224x224 space to original frame size."""
     scaled = lms.copy()
     scaled[:, 0] = lms[:, 0] * orig_w / TFAKE_SIZE
     scaled[:, 1] = lms[:, 1] * orig_h / TFAKE_SIZE
     return scaled
 
 # --- State ---
-linear_cal  = g.CameraLinearCal()
-last_status = [None]
-last_frame  = [None]
+linear_cal        = g.CameraLinearCal()
+last_status       = [None]
+last_frame        = [None]
+last_valid        = [None]
+no_detect_count   = [0]
 
 def on_frame(frame):
     last_frame[0] = frame
@@ -86,8 +90,7 @@ for attempt in range(20):
             last_status[0] = s
             if last_frame[0] is not None:
                 linear_cal.fit(last_frame[0].y16, s)
-            print(f"Calibrated — "
-                  f"min:{s.min_c:.1f} max:{s.max_c:.1f}")
+            print(f"Calibrated — min:{s.min_c:.1f} max:{s.max_c:.1f}")
             break
     except:
         pass
@@ -117,7 +120,7 @@ try:
             continue
 
         # --- Average 10 frames ---
-        all_temps = []
+        all_temps    = []
         latest_frame = None
         for _ in range(10):
             if last_frame[0] is not None and linear_cal.ready():
@@ -129,18 +132,15 @@ try:
             continue
 
         temps_avg = np.mean(all_temps, axis=0)
-        h, w = temps_avg.shape
+        h, w      = temps_avg.shape
 
         # --- Prepare grayscale for T-FAKE ---
-        # Clip to body temp range — makes face bright, background dark
-        clip_min = 28.0
-        clip_max = 38.0
+        clip_min      = 28.0
+        clip_max      = 38.0
         temps_clipped = np.clip(temps_avg, clip_min, clip_max)
-        gray = ((temps_clipped - clip_min) /
-                (clip_max - clip_min) * 255).astype(np.uint8)
-
-        # Resize to 224x224 for T-FAKE
-        gray_224 = cv2.resize(gray, (TFAKE_SIZE, TFAKE_SIZE))
+        gray          = ((temps_clipped - clip_min) /
+                         (clip_max - clip_min) * 255).astype(np.uint8)
+        gray_224      = cv2.resize(gray, (TFAKE_SIZE, TFAKE_SIZE))
 
         # --- Run T-FAKE ---
         try:
@@ -150,7 +150,7 @@ try:
                              len(landmarks) > 0)
         except:
             face_detected = False
-            landmarks = None
+            landmarks     = None
 
         # --- Build display ---
         palette = g.Palette.IronRed
@@ -159,16 +159,16 @@ try:
         display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         display = cv2.resize(display, (w * 2, h * 2))
 
+        # --- Process detections with temporal smoothing ---
         if face_detected:
-            lms   = np.array(landmarks[0],   dtype=np.float32)
-            confs = np.array(confidences[0], dtype=np.float32).flatten() \
-                    if isinstance(confidences, list) else \
-                    np.array(confidences, dtype=np.float32).flatten()
+            lms   = np.array(landmarks[0], dtype=np.float32)
+            confs = np.array(
+                confidences[0] if isinstance(confidences, list)
+                else confidences,
+                dtype=np.float32).flatten()
 
-            # Scale from 224x224 back to original frame size
             lms_scaled = scale_landmarks(lms, w, h)
 
-            # Extract temperatures at key landmarks
             lc_x = int(lms_scaled[LEFT_INNER_CANTHUS,  0])
             lc_y = int(lms_scaled[LEFT_INNER_CANTHUS,  1])
             rc_x = int(lms_scaled[RIGHT_INNER_CANTHUS, 0])
@@ -176,19 +176,49 @@ try:
             ft_x = int(lms_scaled[FOREHEAD_TOP,         0])
             ft_y = int(lms_scaled[FOREHEAD_TOP,         1])
 
-            lc_temp = get_region_temp(temps_avg, lc_x, lc_y, radius=3)
-            rc_temp = get_region_temp(temps_avg, rc_x, rc_y, radius=3)
-            ft_temp = get_region_temp(temps_avg, ft_x, ft_y, radius=5)
+            lc_temp      = get_region_temp(temps_avg, lc_x, lc_y, radius=3)
+            rc_temp      = get_region_temp(temps_avg, rc_x, rc_y, radius=3)
+            ft_temp      = get_region_temp(temps_avg, ft_x, ft_y, radius=5)
+            canthus_temp = max(lc_temp, rc_temp)
+            combined     = (canthus_temp * 0.70) + (ft_temp * 0.30)
+            label, color = classify(combined)
 
-            # Best canthus = higher of two
-            canthus_temp  = max(lc_temp, rc_temp)
+            # Store valid reading
+            last_valid[0] = {
+                "lc_temp": lc_temp, "rc_temp": rc_temp,
+                "ft_temp": ft_temp, "combined": combined,
+                "label":   label,   "color":    color,
+                "lc_xy":  (lc_x, lc_y),
+                "rc_xy":  (rc_x, rc_y),
+                "ft_xy":  (ft_x, ft_y),
+                "lms_scaled": lms_scaled,
+                "confs":  confs
+            }
+            no_detect_count[0] = 0
 
-            # Weighted combination — 70% canthus, 30% forehead
-            combined_temp = (canthus_temp * 0.70) + (ft_temp * 0.30)
+        elif (last_valid[0] is not None and
+              no_detect_count[0] < MAX_NO_DETECT):
+            # Hold last valid reading
+            no_detect_count[0] += 1
+            r          = last_valid[0]
+            lc_temp    = r["lc_temp"];  rc_temp = r["rc_temp"]
+            ft_temp    = r["ft_temp"];  combined = r["combined"]
+            label      = r["label"];    color    = r["color"]
+            lc_x, lc_y = r["lc_xy"]
+            rc_x, rc_y = r["rc_xy"]
+            ft_x, ft_y = r["ft_xy"]
+            lms_scaled = r["lms_scaled"]
+            confs      = r["confs"]
+            face_detected = True
+            print(f"Holding last reading "
+                  f"({no_detect_count[0]}/{MAX_NO_DETECT})")
+        else:
+            last_valid[0]      = None
+            no_detect_count[0] = 0
 
-            label, color = classify(combined_temp)
-
-            # Draw all landmarks
+        # --- Draw results ---
+        if face_detected:
+            # All landmarks
             for i in range(478):
                 px = int(lms_scaled[i, 0]) * 2
                 py = int(lms_scaled[i, 1]) * 2
@@ -198,7 +228,7 @@ try:
                         cv2.circle(display, (px, py),
                                    1, (100, 100, 255), -1)
 
-            # Highlight inner canthus — cyan
+            # Inner canthus — cyan
             cv2.circle(display, (lc_x*2, lc_y*2), 8, (0, 255, 255), 2)
             cv2.circle(display, (rc_x*2, rc_y*2), 8, (0, 255, 255), 2)
             cv2.putText(display, f"{lc_temp:.1f}C",
@@ -210,33 +240,27 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.45, (0, 255, 255), 1)
 
-            # Highlight forehead — orange
+            # Forehead — orange
             cv2.circle(display, (ft_x*2, ft_y*2), 8, (0, 165, 255), 2)
             cv2.putText(display, f"{ft_temp:.1f}C",
                         (ft_x*2 + 8, ft_y*2 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.45, (0, 165, 255), 1)
 
-            # Status text
+            # Status
             cv2.putText(display, label,
                         (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
             cv2.putText(display,
-                        f"LC:{lc_temp:.1f} "
-                        f"RC:{rc_temp:.1f} "
+                        f"LC:{lc_temp:.1f} RC:{rc_temp:.1f} "
                         f"FH:{ft_temp:.1f} "
-                        f"Combined:{combined_temp:.1f}C",
+                        f"Combined:{combined:.1f}C",
                         (20, 75),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, color, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
-            print(f"LC:{lc_temp:.1f}C  "
-                  f"RC:{rc_temp:.1f}C  "
+            print(f"LC:{lc_temp:.1f}C  RC:{rc_temp:.1f}C  "
                   f"FH:{ft_temp:.1f}C  "
-                  f"Combined:{combined_temp:.1f}C  "
-                  f"→ {label}")
-
+                  f"Combined:{combined:.1f}C  → {label}")
         else:
             cv2.putText(display, "NO FACE DETECTED",
                         (20, 40),
