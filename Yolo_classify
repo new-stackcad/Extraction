@@ -1,0 +1,337 @@
+nano ~/guideusb2_linux_sdk/yolo_canthus_classifier.py
+
+git clone https://github.com/soibkhon/thermal-canthus-detector
+pip install ultralytics
+
+PYTHONPATH=build/python python3 yolo_canthus_classifier.py
+
+"""
+Thermal Health Monitor — YOLOv8 Canthus Edition
+================================================
+Drop-in replacement for tfake_classifier.py that uses the
+soibkhon/thermal-canthus-detector model instead of T-FAKE.
+
+Setup
+-----
+# 1. Clone the detector repo alongside this script (or anywhere on the path)
+#    git clone https://github.com/soibkhon/thermal-canthus-detector
+#
+# 2. Install dependencies
+#    pip install ultralytics opencv-python numpy
+#
+# 3. Run (same command as before)
+#    PYTHONPATH=build/python python3 yolo_canthus_classifier.py
+#
+#    Optional: override the weights path
+#    PYTHONPATH=build/python python3 yolo_canthus_classifier.py \
+#        --weights /path/to/thermal_canthus_yolo.pt
+"""
+
+import sys
+import time
+import argparse
+from pathlib import Path
+
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+import cv2
+
+# ---------------------------------------------------------------------------
+# Locate detect_canthus.py  (repo checked out next to this script, or on PATH)
+# ---------------------------------------------------------------------------
+_REPO_CANDIDATES = [
+    Path(__file__).parent / "thermal-canthus-detector",
+    Path(__file__).parent,                      # weights dropped beside script
+    Path.home() / "thermal-canthus-detector",
+]
+for _p in _REPO_CANDIDATES:
+    if (_p / "detect_canthus.py").exists():
+        sys.path.insert(0, str(_p))
+        break
+
+from detect_canthus import load_model, detect as yolo_detect  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Thresholds (SPIRIT 2025, inner canthus)
+# ---------------------------------------------------------------------------
+THRESH_NO_FACE    = 28.0
+THRESH_NORMAL     = 37.1
+THRESH_LOW_FEVER  = 37.5
+THRESH_HIGH_FEVER = 39.0
+
+# Temporal smoothing: hold last valid reading for this many missed frames
+MAX_NO_DETECT = 3
+
+
+def classify(temp_c: float) -> tuple[str, tuple[int, int, int]]:
+    if temp_c < THRESH_NO_FACE:
+        return "NO FACE",    (128, 128, 128)
+    elif temp_c < THRESH_NORMAL:
+        return "NORMAL",     (0, 255, 0)
+    elif temp_c < THRESH_LOW_FEVER:
+        return "LOW FEVER",  (0, 165, 255)
+    elif temp_c < THRESH_HIGH_FEVER:
+        return "HIGH FEVER", (0, 0, 255)
+    else:
+        return "EMERGENCY",  (0, 0, 180)
+
+
+def get_region_temp(
+    temps: np.ndarray, px: int, py: int, radius: int = 3
+) -> float:
+    """Return the max temperature in a square region around (px, py)."""
+    h, w = temps.shape
+    x1, x2 = max(0, px - radius), min(w, px + radius)
+    y1, y2 = max(0, py - radius), min(h, py + radius)
+    region = temps[y1:y2, x1:x2]
+    return float(np.max(region)) if region.size > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Camera state (shared with callback)
+# ---------------------------------------------------------------------------
+linear_cal  = g.CameraLinearCal()
+last_status = [None]
+last_frame  = [None]
+
+
+def on_frame(frame: g.Frame) -> None:
+    last_frame[0] = frame
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Thermal Health Monitor — YOLO canthus")
+    ap.add_argument(
+        "--weights",
+        default=None,
+        help="Path to thermal_canthus_yolo.pt  (auto-detected if omitted)",
+    )
+    ap.add_argument(
+        "--port", default="/dev/ttyACM0", help="Serial port for camera (default: /dev/ttyACM0)"
+    )
+    args = ap.parse_args()
+
+    # --- Resolve weights path ---
+    if args.weights:
+        weights_path = Path(args.weights)
+    else:
+        # Search common locations
+        candidates = [
+            Path(__file__).parent / "thermal-canthus-detector" / "thermal_canthus_yolo.pt",
+            Path(__file__).parent / "thermal_canthus_yolo.pt",
+            Path.home() / "thermal-canthus-detector" / "thermal_canthus_yolo.pt",
+        ]
+        weights_path = next((p for p in candidates if p.exists()), candidates[0])
+
+    print(f"Loading YOLO canthus model from: {weights_path}")
+    model = load_model(weights_path)
+    print("YOLO canthus model ready.")
+
+    # --- Start camera ---
+    cam = g.Camera(g.DeviceInfo(serial_port=args.port))
+    cam.configure_thermography(g.ThermographyConfig(emissivity=98))
+    cam.start(on_frame)
+    print("Warming up... 5 seconds")
+    time.sleep(5)
+
+    # --- Initial calibration ---
+    print("Calibrating...")
+    for _ in range(20):
+        try:
+            s = cam.serial().query_temp_status(retries=2, wait_seconds=1.5)
+            if s:
+                last_status[0] = s
+                if last_frame[0] is not None:
+                    linear_cal.fit(last_frame[0].y16, s)
+                print(f"Calibrated — min:{s.min_c:.1f}  max:{s.max_c:.1f}")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if not linear_cal.ready():
+        print("Calibration failed — exiting.")
+        cam.stop()
+        sys.exit(1)
+
+    # --- Temporal smoothing state ---
+    last_valid      = [None]
+    no_detect_count = [0]
+
+    print("Live view started. Press Q or Escape to quit.")
+    cv2.namedWindow("Thermal Health Monitor", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            # Refresh calibration each loop iteration
+            try:
+                s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+                if s and last_frame[0] is not None:
+                    last_status[0] = s
+                    linear_cal.fit(last_frame[0].y16, s)
+            except Exception:
+                pass
+
+            if last_frame[0] is None or not linear_cal.ready():
+                print("Waiting for calibration...")
+                time.sleep(1)
+                continue
+
+            # --- Average 10 frames for noise reduction ---
+            all_temps    = []
+            latest_frame = None
+            for _ in range(10):
+                if last_frame[0] is not None and linear_cal.ready():
+                    all_temps.append(linear_cal.decode(last_frame[0].y16))
+                    latest_frame = last_frame[0]
+                time.sleep(0.1)
+
+            if not all_temps or latest_frame is None:
+                continue
+
+            temps_avg = np.mean(all_temps, axis=0)   # float32 °C  (h, w)
+            h, w      = temps_avg.shape
+
+            # --- Convert thermal frame to BGR for the YOLO model ---
+            # Use the same iron-red palette the model was trained on,
+            # then apply CLAHE internally (detect_canthus._preprocess handles it).
+            palette = g.Palette.IronRed
+            opts    = g.PaletteOptions(auto_range=True)
+            rgb     = g.apply_palette(latest_frame.y16, palette, opts)
+            bgr     = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)   # model input
+
+            # --- Run YOLO canthus detector ---
+            # detect() accepts a BGR numpy array directly — no resizing needed.
+            try:
+                left_pt, right_pt = yolo_detect(model, bgr)
+                face_detected = (left_pt is not None) or (right_pt is not None)
+            except Exception as exc:
+                print(f"Detection error: {exc}")
+                face_detected = False
+                left_pt = right_pt = None
+
+            # --- Build display (2× upscaled for readability) ---
+            display = cv2.resize(bgr, (w * 2, h * 2))
+
+            # --- Temporal smoothing ---
+            if face_detected:
+                # At least one canthus was found
+                lc_x, lc_y = left_pt  if left_pt  is not None else (0, 0)
+                rc_x, rc_y = right_pt if right_pt is not None else (0, 0)
+
+                lc_temp = (get_region_temp(temps_avg, lc_x, lc_y, radius=3)
+                           if left_pt  is not None else 0.0)
+                rc_temp = (get_region_temp(temps_avg, rc_x, rc_y, radius=3)
+                           if right_pt is not None else 0.0)
+
+                # Use max of the two available readings as the canthus estimate
+                valid_temps = [t for t in (lc_temp, rc_temp) if t > THRESH_NO_FACE]
+                canthus_temp = max(valid_temps) if valid_temps else max(lc_temp, rc_temp)
+
+                # No forehead landmark in this model — use canthus only
+                combined     = canthus_temp
+                label, color = classify(combined)
+
+                last_valid[0] = dict(
+                    lc_temp=lc_temp, rc_temp=rc_temp,
+                    combined=combined, label=label, color=color,
+                    left_pt=left_pt,  right_pt=right_pt,
+                )
+                no_detect_count[0] = 0
+
+            elif last_valid[0] is not None and no_detect_count[0] < MAX_NO_DETECT:
+                # Hold last valid reading for up to MAX_NO_DETECT cycles
+                no_detect_count[0] += 1
+                r            = last_valid[0]
+                lc_temp      = r["lc_temp"]
+                rc_temp      = r["rc_temp"]
+                combined     = r["combined"]
+                label        = r["label"]
+                color        = r["color"]
+                left_pt      = r["left_pt"]
+                right_pt     = r["right_pt"]
+                face_detected = True
+                print(f"Holding last reading ({no_detect_count[0]}/{MAX_NO_DETECT})")
+
+            else:
+                last_valid[0]      = None
+                no_detect_count[0] = 0
+
+            # --- Draw results ---
+            if face_detected:
+                # Left inner canthus — cyan
+                if left_pt is not None:
+                    cv2.circle(display, (left_pt[0]*2,  left_pt[1]*2),  8, (0, 255, 255), 2)
+                    cv2.putText(
+                        display, f"{lc_temp:.1f}C",
+                        (left_pt[0]*2 + 9, left_pt[1]*2 - 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1,
+                    )
+
+                # Right inner canthus — cyan
+                if right_pt is not None:
+                    cv2.circle(display, (right_pt[0]*2, right_pt[1]*2), 8, (0, 255, 255), 2)
+                    cv2.putText(
+                        display, f"{rc_temp:.1f}C",
+                        (right_pt[0]*2 + 9, right_pt[1]*2 - 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1,
+                    )
+
+                # Status banner
+                cv2.putText(display, label,
+                            (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+                cv2.putText(
+                    display,
+                    f"LC:{lc_temp:.1f}  RC:{rc_temp:.1f}  Canthus:{combined:.1f}C",
+                    (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1,
+                )
+
+                print(
+                    f"L-canthus:{lc_temp:.1f}C  "
+                    f"R-canthus:{rc_temp:.1f}C  "
+                    f"Canthus:{combined:.1f}C  → {label}"
+                )
+
+            else:
+                cv2.putText(display, "NO FACE DETECTED",
+                            (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (128, 128, 128), 2)
+                print("No face detected")
+
+            # Camera min/max temperature at bottom
+            if last_status[0] is not None:
+                cv2.putText(
+                    display,
+                    f"min:{last_status[0].min_c:.1f}  max:{last_status[0].max_c:.1f}",
+                    (20, h*2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
+                )
+
+            cv2.imshow("Thermal Health Monitor", display)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (ord('q'), ord('Q'), 27):
+                print("Quitting...")
+                break
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        cam.stop()
+        cv2.destroyAllWindows()
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
