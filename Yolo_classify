@@ -1,3 +1,12 @@
+# Default — tries 1x, 2x, 3x at conf=0.10
+PYTHONPATH=build/python python3 yolo_new_canthus_classifier.py
+
+# More aggressive — skip 1x, go straight to larger scales, even lower conf
+PYTHONPATH=build/python python3 yolo_new_canthus_classifier.py --scales 2 3 4 --conf 0.07
+
+# Conservative — only 1x and 2x, slightly higher conf to reduce false positives
+PYTHONPATH=build/python python3 yolo_new_canthus_classifier.py --scales 1 2 --conf 0.15
+
 nano ~/guideusb2_linux_sdk/yolo_canthus_classifier.py
 
 pip install "numpy<2" --force-reinstall
