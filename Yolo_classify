@@ -1,5 +1,10 @@
 nano ~/guideusb2_linux_sdk/yolo_canthus_classifier.py
 
+pip install "numpy<2" --force-reinstall
+
+python3 -c "import numpy; print(numpy.__version__)"   # should show 1.x
+python3 -c "from ultralytics import YOLO; print('OK')"
+
 git clone https://github.com/soibkhon/thermal-canthus-detector
 pip install ultralytics
 
