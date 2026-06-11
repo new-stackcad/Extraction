@@ -7,11 +7,9 @@ import bme280
 port = 7
 address = 0x76
 bus = smbus2.SMBus(port)
-calibration_params = bme280.load_calibration_params(bus, address)
-data = bme280.sample(bus, address, calibration_params)
-print(f'Temperature: {data.temperature:.2f} C')
-print(f'Humidity:    {data.humidity:.2f} %')
-print(f'Pressure:    {data.pressure:.2f} hPa')
+params = bme280.load_calibration_params(bus, address)
+data = bme280.sample(bus, address, params)
+print(dir(bme280))
 "
 
 for i in 0 1 2 3 4 5; do echo "Bus $i:"; sudo i2cdetect -y -r $i 2>/dev/null; done
