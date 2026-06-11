@@ -1,3 +1,21 @@
+def get_ambient():
+    if USE_BME280:
+        try:
+            import smbus2
+            import bme280
+            bus    = smbus2.SMBus(BME280_PORT)
+            params = bme280.load_calibration_params(bus, BME280_ADDRESS)
+            data   = bme280.sample(bus, BME280_ADDRESS, params)
+            return data.temperature, data.humidity
+        except Exception as e:
+            print(f"BME280 read failed: {e} — using fallback")
+    # Software fallback
+    if last_status[0] is not None:
+        return last_status[0].min_c, None
+    return CALIB_AMBIENT, None
+
+ambient_source  = "BME280" if USE_BME280 else "min_c fallback"
+
 pip3 uninstall bme280
 pip3 install RPi.bme280
 
