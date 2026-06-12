@@ -62,6 +62,8 @@ def _sahi_detect(model, bgr: np.ndarray):
     Returns (left_pt, right_pt) in full-frame coords, same contract as
     detect_canthus.detect().
     """
+    from ultralytics import YOLO  # model is already a YOLO instance
+
     orig_h, orig_w = bgr.shape[:2]
     stride_y = int(SAHI_SLICE_H * (1 - SAHI_OVERLAP))
     stride_x = int(SAHI_SLICE_W * (1 - SAHI_OVERLAP))
@@ -115,11 +117,11 @@ def _sahi_detect(model, bgr: np.ndarray):
 # =============================================================
 USE_BME280             = True    # BME280 connected on I2C bus 7
 BME280_PORT            = 7       # I2C bus number
-BME280_ADDRESS         = 0x76   # I2C address
-CALIB_AMBIENT          = 23.0   # ambient temp at calibration (°C)
-EMISSIVITY             = 0.98   # human skin emissivity
-MAX_NO_DETECT          = 3      # frames to hold last valid detection
-AUTO_SNAPSHOT_INTERVAL = 30     # auto save debug image every N seconds
+BME280_ADDRESS         = 0x76    # I2C address
+CALIB_AMBIENT          = 23.0    # ambient temp at calibration (°C)
+EMISSIVITY             = 0.98    # human skin emissivity
+MAX_NO_DETECT          = 3       # frames to hold last valid detection
+AUTO_SNAPSHOT_INTERVAL = 30      # auto save debug image every N seconds
 LOG_FILE = os.path.expanduser("~/temperature_log.csv")
 SNAP_DIR = os.path.expanduser("~/snapshots")
 
@@ -252,6 +254,7 @@ def build_debug_display(latest_frame, temps_avg, bgr_input,
             # Line connecting the two canthi
             cv2.line(panel, (lc_x*2, lc_y*2), (rc_x*2, rc_y*2),
                      (0, 255, 255), 1)
+
     else:
         cv2.putText(panel1, "NO FACE DETECTED",
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
