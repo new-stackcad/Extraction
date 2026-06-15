@@ -33,7 +33,7 @@ from detect_canthus import load_model  # noqa: E402
 # =============================================================
 SAHI_SLICE_H = 144
 SAHI_SLICE_W = 192
-SAHI_OVERLAP = 0.1   # reduced from 0.3 — fewer patches, faster
+SAHI_OVERLAP = 0.1
 
 def _clahe(img_bgr: np.ndarray) -> np.ndarray:
     gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -41,10 +41,6 @@ def _clahe(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2RGB)
 
 def _sahi_detect(model, bgr: np.ndarray):
-    """
-    Run YOLO on overlapping slices of the frame.
-    Returns (left_pt, right_pt, best_conf) in full-frame coords.
-    """
     orig_h, orig_w = bgr.shape[:2]
     stride_y = int(SAHI_SLICE_H * (1 - SAHI_OVERLAP))
     stride_x = int(SAHI_SLICE_W * (1 - SAHI_OVERLAP))
@@ -103,14 +99,16 @@ LOG_FILE = os.path.expanduser("~/temperature_log.csv")
 SNAP_DIR = os.path.expanduser("~/snapshots")
 
 # Stability parameters
-STABILITY_FRAMES    = 10     # frames to average for temperature
-STABILITY_WARMUP    = 2.0    # seconds to discard after robot stops
-STABILITY_THRESH    = 0.5    # max allowed spread variance (°C) to consider stable
-STABILITY_CHECKS    = 5      # consecutive stable checks before proceeding
+STABILITY_FRAMES  = 10
+STABILITY_WARMUP  = 2.0
+STABILITY_THRESH  = 0.5
+STABILITY_CHECKS  = 5
 
-# Spike guard
-SPIKE_GUARD_DELTA   = 3.0
+# Quality filters
+SPIKE_GUARD_DELTA   = 1.5   # tighter — 1.5C max deviation from rolling avg
 ROLLING_WINDOW      = 5
+SYMMETRY_THRESH     = 1.5   # max LC-RC difference allowed
+FEVER_CONFIRM_COUNT = 2     # consecutive fever readings needed to alert
 
 # Classification thresholds (SPIRIT 2025)
 THRESH_NO_FACE    = 28.0
@@ -161,7 +159,39 @@ def get_region_temp(temps, px, py, radius=3):
     return float(np.max(region)) if region.size > 0 else 0.0
 
 # =============================================================
-# SPIKE GUARD
+# SYMMETRY CHECK
+# LC and RC should be within 1.5C of each other.
+# Large difference = one landmark is on a wrong spot.
+# =============================================================
+def symmetry_check(lc: float, rc: float) -> bool:
+    diff = abs(lc - rc)
+    if diff > SYMMETRY_THRESH:
+        print(f"  [symmetry] rejected — "
+              f"LC:{lc:.1f} RC:{rc:.1f} "
+              f"diff:{diff:.1f}C > {SYMMETRY_THRESH}C")
+        return False
+    return True
+
+# =============================================================
+# FEVER CONFIRMATION
+# Fever only confirmed after N consecutive readings above threshold.
+# Resets immediately if reading drops back to normal.
+# =============================================================
+def confirmed_classify(temp_c: float):
+    label, color = classify(temp_c)
+    if label in ("LOW FEVER", "HIGH FEVER", "EMERGENCY"):
+        fever_streak[0] += 1
+        if fever_streak[0] < FEVER_CONFIRM_COUNT:
+            print(f"  [fever confirm] {label} reading "
+                  f"{fever_streak[0]}/{FEVER_CONFIRM_COUNT} "
+                  f"— not yet confirmed")
+            return "NORMAL", (0, 255, 0)
+    else:
+        fever_streak[0] = 0
+    return label, color
+
+# =============================================================
+# SPIKE GUARD — rolling average filter
 # =============================================================
 _rolling_temps = deque(maxlen=ROLLING_WINDOW)
 
@@ -179,16 +209,8 @@ def spike_guard(new_temp: float) -> bool:
 
 # =============================================================
 # SCENE STABILITY CHECK
-# Wait until the thermal scene is not changing rapidly.
-# This handles the robot settling after movement.
 # =============================================================
 def wait_for_stable_scene(timeout=8.0) -> bool:
-    """
-    Returns True when the scene is thermally stable.
-    Checks that the max-temperature value varies by less than
-    STABILITY_THRESH over STABILITY_CHECKS consecutive reads.
-    Falls through after timeout seconds regardless.
-    """
     print(f"  [stability] warming up {STABILITY_WARMUP}s...")
     time.sleep(STABILITY_WARMUP)
 
@@ -219,22 +241,13 @@ def wait_for_stable_scene(timeout=8.0) -> bool:
 
 # =============================================================
 # FROZEN FRAME CAPTURE
-# Grab a single consistent snapshot: same frame for both
-# temperature averaging AND YOLO detection.
+# Same frame used for temperature AND detection — no drift.
 # =============================================================
 def capture_stable_frame(n_avg=10):
-    """
-    Freezes the current frame reference, then averages n_avg
-    calibrated decodings of that frozen frame.
-    Returns (frozen_frame, temps_avg, bgr) or (None, None, None).
-    """
-    # Freeze at this moment
     frozen = last_frame[0]
     if frozen is None or not linear_cal.ready():
         return None, None, None
 
-    # Decode the same frozen frame n_avg times
-    # (calibration model is deterministic — averaging reduces quantisation noise)
     decoded = []
     for _ in range(n_avg):
         try:
@@ -247,7 +260,6 @@ def capture_stable_frame(n_avg=10):
 
     temps_avg = np.mean(decoded, axis=0)
 
-    # Build BGR from the same frozen frame
     palette = g.Palette.IronRed
     opts    = g.PaletteOptions(auto_range=True)
     rgb     = g.apply_palette(frozen.y16, palette, opts)
@@ -268,28 +280,34 @@ def init_log():
                 "lc_raw", "rc_raw", "canthus_raw",
                 "t_ambient", "humidity",
                 "lc_corrected", "rc_corrected", "canthus_corrected",
-                "detection_conf",
-                "ambient_source", "classification", "holding"
+                "detection_conf", "lc_rc_diff",
+                "ambient_source", "classification", "holding",
+                "fever_streak"
             ])
 
 def log_reading(lc_raw, rc_raw,
                 t_amb, humidity,
                 lc_corr, rc_corr,
                 det_conf,
-                label, ambient_source, holding):
+                label, ambient_source,
+                holding, streak):
+    canthus_raw  = max(lc_raw,  rc_raw)
+    canthus_corr = max(lc_corr, rc_corr)
+    lc_rc_diff   = abs(lc_raw - rc_raw)
     with open(LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             f"{lc_raw:.2f}",          f"{rc_raw:.2f}",
-            f"{max(lc_raw,rc_raw):.2f}",
+            f"{canthus_raw:.2f}",
             f"{t_amb:.2f}",
             f"{humidity:.1f}" if humidity else "N/A",
             f"{lc_corr:.2f}",         f"{rc_corr:.2f}",
-            f"{max(lc_corr,rc_corr):.2f}",
-            f"{det_conf:.3f}",
+            f"{canthus_corr:.2f}",
+            f"{det_conf:.3f}",        f"{lc_rc_diff:.2f}",
             ambient_source, label,
-            "yes" if holding else "no"
+            "yes" if holding else "no",
+            str(streak)
         ])
 
 # =============================================================
@@ -303,10 +321,11 @@ def build_debug_display(frozen_frame, temps_avg, bgr_input,
                         t_amb, humidity,
                         label, color,
                         lc_xy, rc_xy,
-                        ambient_source):
+                        ambient_source,
+                        streak):
     h, w = temps_avg.shape
 
-    # Panel 1 — IronRed thermal with annotations
+    # Panel 1 — IronRed thermal
     palette = g.Palette.IronRed
     opts    = g.PaletteOptions(auto_range=True)
     rgb     = g.apply_palette(frozen_frame.y16, palette, opts)
@@ -315,7 +334,8 @@ def build_debug_display(frozen_frame, temps_avg, bgr_input,
 
     # Panel 2 — BGR fed to YOLO
     panel2 = cv2.resize(bgr_input, (w * 2, h * 2))
-    cv2.putText(panel2, f"YOLO+SAHI  conf:{det_conf:.2f}",
+    cv2.putText(panel2,
+                f"YOLO+SAHI  conf:{det_conf:.2f}",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, (200, 200, 200), 1)
 
@@ -338,10 +358,27 @@ def build_debug_display(frozen_frame, temps_avg, bgr_input,
                      (lc_x*2, lc_y*2), (rc_x*2, rc_y*2),
                      (0, 255, 255), 1)
 
+        # LC-RC diff indicator
+        diff = abs(lc_raw - rc_raw)
+        diff_color = (0, 255, 0) if diff < SYMMETRY_THRESH else (0, 0, 255)
+        cv2.putText(panel1,
+                    f"LC-RC diff: {diff:.1f}C",
+                    (10, h*2 - 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, diff_color, 1)
+
+        # Fever streak indicator
+        if streak > 0:
+            cv2.putText(panel1,
+                        f"Fever streak: {streak}/{FEVER_CONFIRM_COUNT}",
+                        (10, h*2 - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 165, 255), 1)
+
         if holding:
             cv2.putText(panel1,
                         "HOLDING PREV READING",
-                        (10, h*2 - 40),
+                        (10, h*2 - 25),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, (0, 200, 255), 2)
     else:
@@ -365,7 +402,8 @@ def build_debug_display(frozen_frame, temps_avg, bgr_input,
                 f"{datetime.now().strftime('%H:%M:%S')}")
     raw_str  = (f"RAW  LC:{lc_raw:.1f}  RC:{rc_raw:.1f}  "
                 f"Canthus:{canthus_raw:.1f}C  "
-                f"conf:{det_conf:.2f}")
+                f"conf:{det_conf:.2f}  "
+                f"diff:{abs(lc_raw-rc_raw):.1f}C")
     cor_str  = (f"CORR LC:{lc_corr:.1f}  RC:{rc_corr:.1f}  "
                 f"Canthus:{canthus_corr:.1f}C")
 
@@ -397,6 +435,7 @@ last_valid      = [None]
 no_detect_count = [0]
 snapshot_count  = [0]
 last_snap_time  = [time.time()]
+fever_streak    = [0]
 
 def on_frame(frame):
     last_frame[0] = frame
@@ -477,10 +516,10 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # --- Wait for scene to stabilise ---
+            # Wait for scene to stabilise
             wait_for_stable_scene(timeout=8.0)
 
-            # --- Freeze one consistent frame for everything ---
+            # Freeze one consistent frame
             frozen_frame, temps_avg, bgr = capture_stable_frame(
                 n_avg=STABILITY_FRAMES)
             if frozen_frame is None:
@@ -490,11 +529,11 @@ def main():
 
             h, w = temps_avg.shape
 
-            # --- Ambient ---
+            # Ambient
             t_amb, humidity = get_ambient()
             ambient_source  = "BME280" if USE_BME280 else "min_c fallback"
 
-            # --- SAHI detection on frozen frame ---
+            # SAHI detection
             try:
                 left_pt, right_pt, det_conf = _sahi_detect(model, bgr)
                 face_detected = (left_pt is not None) or (right_pt is not None)
@@ -504,7 +543,9 @@ def main():
                 left_pt = right_pt = None
                 det_conf = 0.0
 
-            holding = False
+            holding  = False
+            lc_corr  = 0.0
+            rc_corr  = 0.0
 
             if face_detected:
                 lc_x, lc_y = left_pt  if left_pt  is not None else (0, 0)
@@ -517,23 +558,40 @@ def main():
 
                 canthus_raw = max(lc_raw, rc_raw)
 
-                if not spike_guard(canthus_raw):
+                # --- Filter 1: Symmetry check ---
+                if not symmetry_check(lc_raw, rc_raw):
                     if last_valid[0] is not None:
-                        r       = last_valid[0]
-                        lc_raw  = r["lc_raw"];   rc_raw   = r["rc_raw"]
-                        lc_corr = r["lc_corr"];  rc_corr  = r["rc_corr"]
-                        label   = r["label"];    color    = r["color"]
-                        lc_xy   = r["lc_xy"];    rc_xy    = r["rc_xy"]
-                        det_conf= r["det_conf"]
-                        holding = True
+                        r        = last_valid[0]
+                        lc_raw   = r["lc_raw"];   rc_raw   = r["rc_raw"]
+                        lc_corr  = r["lc_corr"];  rc_corr  = r["rc_corr"]
+                        label    = r["label"];     color    = r["color"]
+                        lc_xy    = r["lc_xy"];     rc_xy    = r["rc_xy"]
+                        det_conf = r["det_conf"]
+                        holding  = True
                     else:
                         face_detected = False
                         det_conf = 0.0
+
+                # --- Filter 2: Spike guard ---
+                elif not spike_guard(canthus_raw):
+                    if last_valid[0] is not None:
+                        r        = last_valid[0]
+                        lc_raw   = r["lc_raw"];   rc_raw   = r["rc_raw"]
+                        lc_corr  = r["lc_corr"];  rc_corr  = r["rc_corr"]
+                        label    = r["label"];     color    = r["color"]
+                        lc_xy    = r["lc_xy"];     rc_xy    = r["rc_xy"]
+                        det_conf = r["det_conf"]
+                        holding  = True
+                    else:
+                        face_detected = False
+                        det_conf = 0.0
+
                 else:
+                    # --- Filter 3: Fever confirmation ---
                     lc_corr = compensate(lc_raw, t_amb)
                     rc_corr = compensate(rc_raw, t_amb)
                     canthus_corr = max(lc_corr, rc_corr)
-                    label, color = classify(canthus_corr)
+                    label, color = confirmed_classify(canthus_corr)
                     lc_xy = (lc_x, lc_y)
                     rc_xy = (rc_x, rc_y)
 
@@ -546,37 +604,42 @@ def main():
                     }
                     no_detect_count[0] = 0
 
-                log_reading(lc_raw, rc_raw,
-                            t_amb, humidity,
-                            lc_corr, rc_corr,
-                            det_conf,
-                            label, ambient_source, holding)
+                if face_detected:
+                    log_reading(lc_raw, rc_raw,
+                                t_amb, humidity,
+                                lc_corr, rc_corr,
+                                det_conf,
+                                label, ambient_source,
+                                holding, fever_streak[0])
 
-                rh_str   = f"{humidity:.0f}%" if humidity else "N/A"
-                hold_str = " [holding]" if holding else ""
-                print(f"[{datetime.now().strftime('%H:%M:%S')}]  "
-                      f"Amb:{t_amb:.1f}C RH:{rh_str}  "
-                      f"conf:{det_conf:.2f}  "
-                      f"RAW LC:{lc_raw:.1f} RC:{rc_raw:.1f}  "
-                      f"CORR LC:{lc_corr:.1f} RC:{rc_corr:.1f}  "
-                      f"-> {label}{hold_str}")
+                    rh_str   = f"{humidity:.0f}%" if humidity else "N/A"
+                    hold_str = " [holding]" if holding else ""
+                    diff_str = f" diff:{abs(lc_raw-rc_raw):.1f}C"
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}]  "
+                          f"Amb:{t_amb:.1f}C RH:{rh_str}  "
+                          f"conf:{det_conf:.2f}{diff_str}  "
+                          f"RAW LC:{lc_raw:.1f} RC:{rc_raw:.1f}  "
+                          f"CORR LC:{lc_corr:.1f} RC:{rc_corr:.1f}  "
+                          f"-> {label}{hold_str}")
 
             elif last_valid[0] is not None \
                     and no_detect_count[0] < MAX_NO_DETECT:
                 no_detect_count[0] += 1
-                r       = last_valid[0]
-                lc_raw  = r["lc_raw"];   rc_raw  = r["rc_raw"]
-                lc_corr = r["lc_corr"];  rc_corr = r["rc_corr"]
-                label   = r["label"];    color   = r["color"]
-                lc_xy   = r["lc_xy"];    rc_xy   = r["rc_xy"]
-                det_conf= r["det_conf"]
+                r        = last_valid[0]
+                lc_raw   = r["lc_raw"];   rc_raw   = r["rc_raw"]
+                lc_corr  = r["lc_corr"];  rc_corr  = r["rc_corr"]
+                label    = r["label"];    color    = r["color"]
+                lc_xy    = r["lc_xy"];    rc_xy    = r["rc_xy"]
+                det_conf = r["det_conf"]
                 face_detected = True
-                holding = True
+                holding  = True
                 print(f"Holding last reading "
                       f"({no_detect_count[0]}/{MAX_NO_DETECT})")
+
             else:
                 last_valid[0]      = None
                 no_detect_count[0] = 0
+                fever_streak[0]    = 0
                 lc_raw = rc_raw = lc_corr = rc_corr = 0.0
                 det_conf = 0.0
                 label, color = "NO FACE", (128, 128, 128)
@@ -587,7 +650,7 @@ def main():
             lc_xy = last_valid[0]["lc_xy"] if last_valid[0] else (0, 0)
             rc_xy = last_valid[0]["rc_xy"] if last_valid[0] else (0, 0)
 
-            # --- Build display ---
+            # Build display
             display, _ = build_debug_display(
                 frozen_frame, temps_avg, bgr,
                 face_detected, holding,
@@ -597,7 +660,8 @@ def main():
                 t_amb, humidity,
                 label, color,
                 lc_xy, rc_xy,
-                ambient_source)
+                ambient_source,
+                fever_streak[0])
 
             cv2.imshow("Thermal Health Monitor", display)
             key = cv2.waitKey(30) & 0xFF
